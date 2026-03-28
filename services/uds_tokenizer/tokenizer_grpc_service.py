@@ -15,7 +15,9 @@
 """Synchronous gRPC service for tokenizer operations optimized for CPU-intensive tasks."""
 
 import asyncio
+import json
 import grpc
+from typing import Any
 from grpc_reflection.v1alpha import reflection
 import logging
 import threading
@@ -30,9 +32,12 @@ sys.path.append(os.path.dirname(__file__))
 # Import protobuf-generated modules
 import tokenizerpb.tokenizer_pb2 as tokenizer_pb2
 import tokenizerpb.tokenizer_pb2_grpc as tokenizer_pb2_grpc
+from google.protobuf.json_format import MessageToDict
 from tokenizer_service.tokenizer import TokenizerService
 from tokenizer_service.renderer import RendererService
 from utils.thread_pool_utils import get_thread_pool_size
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 
 
 class TokenizationServiceServicer(tokenizer_pb2_grpc.TokenizationServiceServicer):
@@ -94,10 +99,17 @@ class TokenizationServiceServicer(tokenizer_pb2_grpc.TokenizationServiceServicer
             # logging.info(f"Received chat template request")
 
             # Convert the nested conversation turns to a flat list of messages
-            messages: list[dict[str, str]] = []
+            messages: list[dict[str, Any]] = []
             for turn in request.conversation_turns:
                 for msg in turn.messages:
-                    messages.append({"role": msg.role, "content": msg.content})
+                    if msg.content_parts:
+                        content_value = [
+                            MessageToDict(part, preserving_proto_field_name=True)
+                            for part in msg.content_parts
+                        ]
+                    else:
+                        content_value = msg.content if msg.HasField("content") else None
+                    messages.append({"role": msg.role, "content": content_value})
 
             # Call tokenizer_service method with model name
             prompt = self.tokenizer_service.apply_template(messages, request.model_name)
@@ -180,10 +192,42 @@ class TokenizationServiceServicer(tokenizer_pb2_grpc.TokenizationServiceServicer
     ) -> tokenizer_pb2.RenderChatCompletionResponse:
         """Render an OpenAI chat completion request via OpenAIServingRender."""
         try:
+            request_dict = MessageToDict(request, preserving_proto_field_name=True)
+
+            messages = request_dict.get("messages", [])
+            for msg in messages:
+                if "content_parts" in msg:
+                    # multimodal: repeated ContentPart → OpenAI content array
+                    msg["content"] = msg.pop("content_parts")
+
+            tools = (
+                json.loads(request_dict["tools_json"])
+                if request_dict.get("tools_json")
+                else None
+            )
+            chat_template = request.chat_template or None
+            chat_template_kwargs = (
+                json.loads(request_dict["chat_template_kwargs"])
+                if request_dict.get("chat_template_kwargs")
+                else None
+            )
+            add_generation_prompt = (
+                request.add_generation_prompt
+                if request.HasField("add_generation_prompt")
+                else True
+            )
+
+            chat_request = ChatCompletionRequest(
+                model=request_dict["model_name"],
+                messages=messages,
+                tools=tools,
+                chat_template=chat_template,
+                add_generation_prompt=add_generation_prompt,
+                continue_final_message=request.continue_final_message,
+                chat_template_kwargs=chat_template_kwargs,
+            )
             result = asyncio.run_coroutine_threadsafe(
-                self.renderer_service.render_chat(
-                    request.request_json, request.model_name
-                ),
+                self.renderer_service.render_chat(chat_request, request.model_name),
                 self._loop,
             ).result()
             return self._generate_request_to_proto(result)
@@ -198,16 +242,22 @@ class TokenizationServiceServicer(tokenizer_pb2_grpc.TokenizationServiceServicer
     ) -> tokenizer_pb2.RenderCompletionResponse:
         """Render an OpenAI completion request via OpenAIServingRender."""
         try:
+            completion_request = CompletionRequest(
+                model=request.model_name,
+                prompt=request.prompt,
+            )
             results = asyncio.run_coroutine_threadsafe(
                 self.renderer_service.render_completion(
-                    request.request_json, request.model_name
+                    completion_request, request.model_name
                 ),
                 self._loop,
             ).result()
-            items: list[tokenizer_pb2.RenderChatCompletionResponse] = [
-                self._generate_request_to_proto(r) for r in results
-            ]
-            return tokenizer_pb2.RenderCompletionResponse(items=items, success=True)
+            result = results[0]
+            return tokenizer_pb2.RenderCompletionResponse(
+                request_id=result.request_id,
+                token_ids=list(result.token_ids),
+                success=True,
+            )
         except Exception as e:
             logging.error(f"RenderCompletion failed: {e}", exc_info=True)
             context.abort(grpc.StatusCode.INTERNAL, str(e))
